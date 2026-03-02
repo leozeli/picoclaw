@@ -42,6 +42,15 @@ type AgentLoop struct {
 	fallback       *providers.FallbackChain
 	channelManager *channels.Manager
 	mediaStore     media.MediaStore
+
+	// Legacy interrupt handling (to be deprecated)
+	interruptHandler InterruptHandler // Interrupt handler for dynamic task management
+	taskManager      *TaskManager     // Task manager for concurrent task tracking (Phase 2)
+
+	// New steering architecture (nanobot-inspired)
+	enableSteering    bool                            // Opt-in flag for steering feature
+	interruptCheckers map[string]*InterruptionChecker // Per-session interrupt queues
+	checkersMu        sync.RWMutex                    // Protects interruptCheckers map
 }
 
 // processOptions configures how a message is processed
@@ -75,14 +84,33 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 		stateManager = state.NewManager(defaultAgent.Workspace)
 	}
 
-	return &AgentLoop{
+	al := &AgentLoop{
 		bus:         msgBus,
 		cfg:         cfg,
 		registry:    registry,
 		state:       stateManager,
 		summarizing: sync.Map{},
 		fallback:    fallbackChain,
+
+		// New steering architecture (nanobot-inspired)
+		enableSteering:    cfg.Agents.Defaults.EnableSteering,
+		interruptCheckers: make(map[string]*InterruptionChecker),
 	}
+
+	// Legacy components (DEPRECATED - only initialized when new steering is disabled)
+	if !cfg.Agents.Defaults.EnableSteering {
+		// Legacy interrupt handler (Phase 1.5)
+		al.interruptHandler = NewBusInterruptHandler(msgBus, DefaultInterruptionConfig())
+
+		// Legacy TaskManager (Phase 2)
+		maxConcurrent := cfg.Agents.Defaults.MaxConcurrentTasks
+		if maxConcurrent < 0 {
+			maxConcurrent = 0 // Ensure no negative values, 0 = unlimited
+		}
+		al.taskManager = NewTaskManager(maxConcurrent)
+	}
+
+	return al
 }
 
 // registerSharedTools registers tools that are shared across all agents (web, message, spawn).
@@ -170,9 +198,24 @@ func registerSharedTools(
 func (al *AgentLoop) Run(ctx context.Context) error {
 	al.running.Store(true)
 
+	// Legacy: Start task cleanup and steering loop only when new steering is disabled
+	if !al.enableSteering {
+		// Phase 2: Start task cleanup goroutine
+		go al.runTaskCleanup(ctx)
+
+		// Phase 2: Start steering loop if enabled
+		if al.cfg.Agents.Defaults.EnableSteeringLoop {
+			go al.runSteeringLoop(ctx)
+		}
+	}
+
 	for al.running.Load() {
 		select {
 		case <-ctx.Done():
+			// Legacy: Wait for running tasks to complete (only if using TaskManager)
+			if !al.enableSteering && al.taskManager != nil {
+				al.waitForRunningTasks(5 * time.Second)
+			}
 			return nil
 		default:
 			msg, ok := al.bus.ConsumeInbound(ctx)
@@ -180,8 +223,37 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				continue
 			}
 
-			// Process message
-			func() {
+			// ===== NEW: Steering Architecture - Check for active session =====
+			if al.enableSteering {
+				// Get session key for this message (needs routing resolution)
+				sessionKey := al.getSessionKeyForMessage(msg)
+
+				// Check if this session has an active checker (task is running)
+				if al.hasActiveChecker(sessionKey) {
+					// Session is active, signal interruption instead of creating new task
+					checker := al.getOrCreateChecker(sessionKey)
+					checker.Signal(msg)
+
+					logger.InfoCF("agent", "Steering: signaled interruption for active session",
+						map[string]any{
+							"session_key":     sessionKey,
+							"channel":         msg.Channel,
+							"chat_id":         msg.ChatID,
+							"content_preview": utils.Truncate(msg.Content, 60),
+						})
+					continue // Don't process as new message
+				}
+			}
+
+			// Phase 2: Process message asynchronously
+			go func(msg bus.InboundMessage) {
+				defer func() {
+					if r := recover(); r != nil {
+						logger.ErrorCF("agent", "Panic in message processing",
+							map[string]any{"error": r, "channel": msg.Channel, "chat_id": msg.ChatID})
+					}
+				}()
+
 				// TODO: Re-enable media cleanup after inbound media is properly consumed by the agent.
 				// Currently disabled because files are deleted before the LLM can access their content.
 				// defer func() {
@@ -197,6 +269,16 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 
 				response, err := al.processMessage(ctx, msg)
 				if err != nil {
+					// Phase 2: Don't send error message if task was canceled
+					// (user already received confirmation from /stop command)
+					if errors.Is(err, context.Canceled) {
+						logger.InfoCF("agent", "Task canceled, skipping error response",
+							map[string]any{
+								"channel": msg.Channel,
+								"chat_id": msg.ChatID,
+							})
+						return // Silent return on cancellation
+					}
 					response = fmt.Sprintf("Error processing message: %v", err)
 				}
 
@@ -234,7 +316,7 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 						)
 					}
 				}
-			}()
+			}(msg)
 		}
 	}
 
@@ -245,12 +327,250 @@ func (al *AgentLoop) Stop() {
 	al.running.Store(false)
 }
 
+// runTaskCleanup periodically cleans up old completed tasks (Phase 2)
+func (al *AgentLoop) runTaskCleanup(ctx context.Context) {
+	// Get cleanup interval from config, default to 5 minutes
+	intervalMins := al.cfg.Agents.Defaults.TaskCleanupIntervalMins
+	if intervalMins <= 0 {
+		intervalMins = 5
+	}
+
+	// Get retention time from config, default to 1 hour
+	retentionHours := al.cfg.Agents.Defaults.TaskRetentionHours
+	if retentionHours <= 0 {
+		retentionHours = 1
+	}
+
+	ticker := time.NewTicker(time.Duration(intervalMins) * time.Minute)
+	defer ticker.Stop()
+
+	logger.InfoCF("agent", "Task cleanup loop started",
+		map[string]any{
+			"interval_mins":   intervalMins,
+			"retention_hours": retentionHours,
+		})
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.InfoCF("agent", "Task cleanup loop stopped", nil)
+			return
+		case <-ticker.C:
+			removed := al.taskManager.Cleanup(time.Duration(retentionHours) * time.Hour)
+			if removed > 0 {
+				logger.DebugCF("agent", "Cleaned up old tasks",
+					map[string]any{"removed": removed})
+			}
+		}
+	}
+}
+
+// waitForRunningTasks waits for all running tasks to complete or timeout (Phase 2)
+func (al *AgentLoop) waitForRunningTasks(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for {
+		tasks := al.taskManager.GetRunningTasks()
+		if len(tasks) == 0 {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			logger.WarnCF("agent", "Timeout waiting for tasks, some may be abandoned",
+				map[string]any{"running_tasks": len(tasks)})
+			return
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// runSteeringLoop monitors for interrupt signals and cancels tasks (Phase 2 Step 5)
+func (al *AgentLoop) runSteeringLoop(ctx context.Context) {
+	// Get interval from config, default to 500ms
+	intervalMs := al.cfg.Agents.Defaults.SteeringLoopIntervalMs
+	if intervalMs <= 0 {
+		intervalMs = 500
+	}
+
+	ticker := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
+	defer ticker.Stop()
+
+	logger.InfoCF("agent", "Steering loop started",
+		map[string]any{"interval_ms": intervalMs})
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.InfoCF("agent", "Steering loop stopped", nil)
+			return
+		case <-ticker.C:
+			al.checkAndHandleInterrupts(ctx)
+		}
+	}
+}
+
+// checkAndHandleInterrupts checks for interrupt signals and handles them (Phase 2 Step 5)
+func (al *AgentLoop) checkAndHandleInterrupts(ctx context.Context) {
+	if al.interruptHandler == nil {
+		return
+	}
+
+	// Check for interruption signal
+	signal, err := al.interruptHandler.CheckInterruption(ctx)
+	if err != nil {
+		logger.WarnCF("agent", "Interrupt check failed",
+			map[string]any{"error": err.Error()})
+		return
+	}
+
+	if signal == nil || signal.Priority < 8 {
+		return // No interrupt or priority not high enough
+	}
+
+	// High-priority interrupt detected
+	logger.InfoCF("agent", "High-priority interrupt detected by steering loop",
+		map[string]any{
+			"type":     signal.Type,
+			"priority": signal.Priority,
+			"source":   signal.Source,
+		})
+
+	// If it's a user message interrupt, check if we need to cancel existing tasks
+	if signal.Type == "user_message" {
+		if msg, ok := signal.Data.(bus.InboundMessage); ok {
+			// Cancel all running tasks for the same session
+			canceled := al.taskManager.CancelAllTasksForSession(msg.Channel, msg.ChatID)
+
+			if canceled > 0 {
+				logger.InfoCF("agent", "Canceled tasks for new high-priority message",
+					map[string]any{
+						"channel":        msg.Channel,
+						"chat_id":        msg.ChatID,
+						"canceled_count": canceled,
+					})
+
+				// Send notification to user
+				al.bus.PublishOutbound(ctx, bus.OutboundMessage{
+					Channel: msg.Channel,
+					ChatID:  msg.ChatID,
+					Content: "Previous task interrupted. Processing your new request...",
+				})
+			}
+
+			// Put the interrupt message back in the queue for normal processing
+			go func() {
+				pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				al.bus.PublishInbound(pubCtx, msg)
+			}()
+		}
+	}
+}
+
 func (al *AgentLoop) RegisterTool(tool tools.Tool) {
 	for _, agentID := range al.registry.ListAgentIDs() {
 		if agent, ok := al.registry.GetAgent(agentID); ok {
 			agent.Tools.Register(tool)
 		}
 	}
+}
+
+// ===== Steering Architecture: InterruptionChecker Management =====
+
+// getOrCreateChecker gets or creates an interruption checker for a session.
+// Thread-safe with double-checked locking pattern.
+func (al *AgentLoop) getOrCreateChecker(sessionKey string) *InterruptionChecker {
+	// Fast path: read lock
+	al.checkersMu.RLock()
+	checker, exists := al.interruptCheckers[sessionKey]
+	al.checkersMu.RUnlock()
+
+	if exists {
+		return checker
+	}
+
+	// Slow path: write lock
+	al.checkersMu.Lock()
+	defer al.checkersMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if checker, exists := al.interruptCheckers[sessionKey]; exists {
+		return checker
+	}
+
+	// Create new checker
+	checker = NewInterruptionChecker()
+	al.interruptCheckers[sessionKey] = checker
+
+	logger.DebugCF("agent", "Created interruption checker for session",
+		map[string]any{"session_key": sessionKey})
+
+	return checker
+}
+
+// formatInterruptionInjection formats pending interruption messages for injection into conversation.
+// This follows nanobot's pattern of providing context to the LLM about the interruption.
+func formatInterruptionInjection(pending []bus.InboundMessage) string {
+	if len(pending) == 0 {
+		return ""
+	}
+
+	var combined strings.Builder
+	for i, msg := range pending {
+		if i > 0 {
+			combined.WriteString("\n\n---\n\n")
+		}
+		combined.WriteString(msg.Content)
+	}
+
+	injection := "[The user just sent a new message while you were working. " +
+		"Read it and decide: continue current work, switch to the new request, or address both.]\n\n" +
+		combined.String()
+
+	return injection
+}
+
+// removeChecker removes a checker when session completes.
+// This prevents memory leaks for long-running processes.
+func (al *AgentLoop) removeChecker(sessionKey string) {
+	al.checkersMu.Lock()
+	defer al.checkersMu.Unlock()
+
+	if _, exists := al.interruptCheckers[sessionKey]; exists {
+		delete(al.interruptCheckers, sessionKey)
+		logger.DebugCF("agent", "Removed interruption checker for session",
+			map[string]any{"session_key": sessionKey})
+	}
+}
+
+// hasActiveChecker checks if a session has an active interruption checker.
+// This indicates the session is currently processing a message.
+func (al *AgentLoop) hasActiveChecker(sessionKey string) bool {
+	al.checkersMu.RLock()
+	defer al.checkersMu.RUnlock()
+	_, exists := al.interruptCheckers[sessionKey]
+	return exists
+}
+
+// getSessionKeyForMessage resolves the session key for a message using routing logic.
+// This is needed to check if the session has an active task before creating a new one.
+func (al *AgentLoop) getSessionKeyForMessage(msg bus.InboundMessage) string {
+	// If message already has an agent-scoped session key, use it
+	if msg.SessionKey != "" && strings.HasPrefix(msg.SessionKey, "agent:") {
+		return msg.SessionKey
+	}
+
+	// Otherwise, resolve via routing
+	route := al.registry.ResolveRoute(routing.RouteInput{
+		Channel:    msg.Channel,
+		AccountID:  msg.Metadata["account_id"],
+		Peer:       extractPeer(msg),
+		ParentPeer: extractParentPeer(msg),
+		GuildID:    msg.Metadata["guild_id"],
+		TeamID:     msg.Metadata["team_id"],
+	})
+
+	return route.SessionKey
 }
 
 func (al *AgentLoop) SetChannelManager(cm *channels.Manager) {
@@ -260,6 +580,12 @@ func (al *AgentLoop) SetChannelManager(cm *channels.Manager) {
 // SetMediaStore injects a MediaStore for media lifecycle management.
 func (al *AgentLoop) SetMediaStore(s media.MediaStore) {
 	al.mediaStore = s
+}
+
+// SetInterruptHandler sets or replaces the interrupt handler for the agent loop.
+// This allows dynamic configuration of interruption behavior at runtime.
+func (al *AgentLoop) SetInterruptHandler(handler InterruptHandler) {
+	al.interruptHandler = handler
 }
 
 // inferMediaType determines the media type ("image", "audio", "video", "file")
@@ -364,6 +690,54 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			"session_key": msg.SessionKey,
 		})
 
+	// New steering architecture: Direct processing without task management
+	if al.enableSteering {
+		return al.processMessageDirect(ctx, msg)
+	}
+
+	// Legacy: Phase 2 task management
+	priority := 5 // Default priority
+	if busHandler, ok := al.interruptHandler.(*BusInterruptHandler); ok {
+		priority = busHandler.calculatePriority(msg)
+	}
+
+	task := NewTask(msg, priority)
+	if err := al.taskManager.AddTask(task); err != nil {
+		return "", fmt.Errorf("failed to add task: %w", err)
+	}
+
+	// Start task (synchronous mode for now - Phase 2 Step 2)
+	if err := al.taskManager.StartTask(task.ID, ctx); err != nil {
+		return "", fmt.Errorf("failed to start task: %w", err)
+	}
+
+	// Use task's context for cancellation support
+	taskCtx := task.Context()
+
+	// Defer task completion/failure to ensure it's always updated
+	defer func() {
+		// Check if task is still running (not already completed/failed/canceled)
+		if taskObj, exists := al.taskManager.GetTask(task.ID); exists {
+			if taskObj.Status == TaskStatusRunning {
+				al.taskManager.CompleteTask(task.ID)
+			}
+		}
+	}()
+
+	// Delegate to helper function for actual processing
+	response, err := al.processMessageWithTask(taskCtx, task, msg)
+	// Update task status based on result
+	if err != nil {
+		al.taskManager.FailTask(task.ID, err)
+		return "", err
+	}
+
+	// Task will be completed by defer
+	return response, nil
+}
+
+// processMessageDirect handles message processing for new steering architecture (no task management)
+func (al *AgentLoop) processMessageDirect(ctx context.Context, msg bus.InboundMessage) (string, error) {
 	// Route system messages to processSystemMessage
 	if msg.Channel == "system" {
 		return al.processSystemMessage(ctx, msg)
@@ -371,6 +745,61 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 
 	// Check for commands
 	if response, handled := al.handleCommand(ctx, msg); handled {
+		return response, nil
+	}
+
+	// Route to determine agent and session key
+	route := al.registry.ResolveRoute(routing.RouteInput{
+		Channel:    msg.Channel,
+		AccountID:  msg.Metadata["account_id"],
+		Peer:       extractPeer(msg),
+		ParentPeer: extractParentPeer(msg),
+		GuildID:    msg.Metadata["guild_id"],
+		TeamID:     msg.Metadata["team_id"],
+	})
+
+	agent, ok := al.registry.GetAgent(route.AgentID)
+	if !ok {
+		agent = al.registry.GetDefaultAgent()
+	}
+	if agent == nil {
+		return "", fmt.Errorf("no agent available for route (agent_id=%s)", route.AgentID)
+	}
+
+	// Reset message-tool state for this round
+	if tool, ok := agent.Tools.Get("message"); ok {
+		if mt, ok := tool.(tools.ContextualTool); ok {
+			mt.SetContext(msg.Channel, msg.ChatID)
+		}
+	}
+
+	// Use routed session key, but honor pre-set agent-scoped keys
+	sessionKey := route.SessionKey
+	if msg.SessionKey != "" && strings.HasPrefix(msg.SessionKey, "agent:") {
+		sessionKey = msg.SessionKey
+	}
+
+	return al.runAgentLoop(ctx, agent, processOptions{
+		SessionKey:    sessionKey,
+		Channel:       msg.Channel,
+		ChatID:        msg.ChatID,
+		UserMessage:   msg.Content,
+		EnableSummary: true,
+		SendResponse:  false,
+	})
+}
+
+// processMessageWithTask handles the actual message processing logic with task context (LEGACY)
+func (al *AgentLoop) processMessageWithTask(ctx context.Context, task *Task, msg bus.InboundMessage) (string, error) {
+	// Route system messages to processSystemMessage
+	if msg.Channel == "system" {
+		return al.processSystemMessage(ctx, msg)
+	}
+
+	// Check for commands
+	if response, handled := al.handleCommand(ctx, msg); handled {
+		// Mark task as a command task (for filtering in cancellation counts)
+		task.Metadata["is_command"] = true
 		return response, nil
 	}
 
@@ -410,6 +839,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			"agent_id":    agent.ID,
 			"session_key": sessionKey,
 			"matched_by":  route.MatchedBy,
+			"task_id":     task.ID,
 		})
 
 	return al.runAgentLoop(ctx, agent, processOptions{
@@ -484,7 +914,28 @@ func (al *AgentLoop) processSystemMessage(ctx context.Context, msg bus.InboundMe
 
 // runAgentLoop is the core message processing logic.
 func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opts processOptions) (string, error) {
-	// 0. Record last channel for heartbeat notifications (skip internal channels)
+	// Phase 2 Step 4: Check if context is already canceled before starting
+	select {
+	case <-ctx.Done():
+		return "", fmt.Errorf("task canceled before execution: %w", ctx.Err())
+	default:
+	}
+
+	// ===== NEW: Steering Architecture - Setup checker for this session =====
+	if al.enableSteering {
+		// Create checker to signal this session is active
+		al.getOrCreateChecker(opts.SessionKey)
+
+		// Cleanup checker when done
+		defer al.removeChecker(opts.SessionKey)
+	}
+
+	// 0a. Update interrupt handler context
+	if busHandler, ok := al.interruptHandler.(*BusInterruptHandler); ok {
+		busHandler.SetContext(opts.Channel, opts.ChatID)
+	}
+
+	// 0b. Record last channel for heartbeat notifications (skip internal channels)
 	if opts.Channel != "" && opts.ChatID != "" {
 		// Don't record internal channels (cli, system, subagent)
 		if !constants.IsInternalChannel(opts.Channel) {
@@ -504,6 +955,22 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	if !opts.NoHistory {
 		history = agent.Sessions.GetHistory(opts.SessionKey)
 		summary = agent.Sessions.GetSummary(opts.SessionKey)
+
+		// Sanitize history to remove incomplete tool call sequences
+		// This prevents API errors when resuming after task interruption/cancellation
+		sanitizedHistory := sanitizeIncompleteToolCalls(history)
+		if len(sanitizedHistory) != len(history) {
+			logger.WarnCF("agent", "Sanitized incomplete tool calls from session history",
+				map[string]any{
+					"session_key":     opts.SessionKey,
+					"original_count":  len(history),
+					"sanitized_count": len(sanitizedHistory),
+				})
+			// Update the session with sanitized history
+			agent.Sessions.SetHistory(opts.SessionKey, sanitizedHistory)
+			agent.Sessions.Save(opts.SessionKey)
+			history = sanitizedHistory
+		}
 	}
 	messages := agent.ContextBuilder.BuildMessages(
 		history,
@@ -520,6 +987,19 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	// 4. Run LLM iteration loop
 	finalContent, iteration, err := al.runLLMIteration(ctx, agent, messages, opts)
 	if err != nil {
+		// Special handling for interruption errors
+		if errors.Is(err, ErrInterrupted) {
+			logger.InfoCF("agent", "Agent execution interrupted by high-priority signal",
+				map[string]any{
+					"agent_id":   agent.ID,
+					"session":    opts.SessionKey,
+					"iterations": iteration,
+				})
+			// Save current state
+			agent.Sessions.Save(opts.SessionKey)
+			// Return a user-friendly message
+			return "Task interrupted by higher priority request. Progress has been saved.", nil
+		}
 		return "", err
 	}
 
@@ -628,6 +1108,13 @@ func (al *AgentLoop) runLLMIteration(
 	for iteration < agent.MaxIterations {
 		iteration++
 
+		// Phase 2 Step 4: Check for context cancellation at start of each iteration
+		select {
+		case <-ctx.Done():
+			return "", iteration, fmt.Errorf("iteration canceled: %w", ctx.Err())
+		default:
+		}
+
 		logger.DebugCF("agent", "LLM iteration",
 			map[string]any{
 				"agent_id":  agent.ID,
@@ -668,9 +1155,9 @@ func (al *AgentLoop) runLLMIteration(
 				fbResult, fbErr := al.fallback.Execute(ctx, agent.Candidates,
 					func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
 						return agent.Provider.Chat(ctx, messages, providerToolDefs, model, map[string]any{
-							"max_tokens":       agent.MaxTokens,
-							"temperature":      agent.Temperature,
-							"prompt_cache_key": agent.ID,
+							"max_tokens":  agent.MaxTokens,
+							"temperature": agent.Temperature,
+							// "prompt_cache_key": agent.ID,
 						})
 					},
 				)
@@ -685,9 +1172,9 @@ func (al *AgentLoop) runLLMIteration(
 				return fbResult.Response, nil
 			}
 			return agent.Provider.Chat(ctx, messages, providerToolDefs, agent.Model, map[string]any{
-				"max_tokens":       agent.MaxTokens,
-				"temperature":      agent.Temperature,
-				"prompt_cache_key": agent.ID,
+				"max_tokens":  agent.MaxTokens,
+				"temperature": agent.Temperature,
+				// "prompt_cache_key": agent.ID,
 			})
 		}
 
@@ -778,8 +1265,53 @@ func (al *AgentLoop) runLLMIteration(
 				"target_channel": al.targetReasoningChannelID(opts.Channel),
 				"channel":        opts.Channel,
 			})
-		// Check if no tool calls - we're done
+		// Check if no tool calls - but first check for pending interruptions
 		if len(response.ToolCalls) == 0 {
+			// NEW: Check for pending interruptions before finishing
+			if al.enableSteering {
+				checker := al.getOrCreateChecker(opts.SessionKey)
+				pending := checker.DrainAll()
+				
+				if len(pending) > 0 {
+					logger.InfoCF("agent", "Steering: LLM finished but has pending interruptions, injecting",
+						map[string]any{
+							"session_key":   opts.SessionKey,
+							"pending_count": len(pending),
+							"iteration":     iteration,
+						})
+					
+					// Save the assistant's response first
+					assistantMsg := providers.Message{
+						Role:    "assistant",
+						Content: response.Content,
+					}
+					messages = append(messages, assistantMsg)
+					agent.Sessions.AddMessage(opts.SessionKey, "assistant", response.Content)
+					
+					// Send the response to user
+					if !constants.IsInternalChannel(opts.Channel) {
+						al.bus.PublishOutbound(ctx, bus.OutboundMessage{
+							Channel: opts.Channel,
+							ChatID:  opts.ChatID,
+							Content: response.Content,
+						})
+					}
+					
+					// Format and inject interruption
+					injectionContent := formatInterruptionInjection(pending)
+					injectionMsg := providers.Message{
+						Role:    "user",
+						Content: injectionContent,
+					}
+					messages = append(messages, injectionMsg)
+					agent.Sessions.AddMessage(opts.SessionKey, "user", injectionContent)
+					
+					// Continue to handle the interruption
+					continue
+				}
+			}
+			
+			// No interruptions, finish normally
 			finalContent = response.Content
 			logger.InfoCF("agent", "LLM response without tool calls (direct answer)",
 				map[string]any{
@@ -842,7 +1374,52 @@ func (al *AgentLoop) runLLMIteration(
 		agent.Sessions.AddFullMessage(opts.SessionKey, assistantMsg)
 
 		// Execute tool calls
-		for _, tc := range normalizedToolCalls {
+		for i, tc := range normalizedToolCalls {
+			// Phase 2 Step 4: Check for context cancellation before each tool execution
+			select {
+			case <-ctx.Done():
+				return "", iteration, fmt.Errorf("tool execution canceled: %w", ctx.Err())
+			default:
+			}
+
+			// Check for interruption before each tool call
+			if al.interruptHandler != nil {
+				signal, checkErr := al.interruptHandler.CheckInterruption(ctx)
+				if checkErr != nil {
+					logger.WarnCF("agent", "Interruption check failed",
+						map[string]any{"error": checkErr.Error()})
+				}
+
+				if signal != nil && signal.Priority >= 8 {
+					logger.InfoCF("agent", "High-priority interruption detected during tool execution",
+						map[string]any{
+							"type":        signal.Type,
+							"priority":    signal.Priority,
+							"source":      signal.Source,
+							"tool":        tc.Name,
+							"tool_index":  i,
+							"total_tools": len(normalizedToolCalls),
+						})
+
+					// Save current progress to session
+					agent.Sessions.Save(opts.SessionKey)
+
+					// If it's a user message interruption, put the message back
+					if signal.Type == "user_message" && signal.Data != nil {
+						if msg, ok := signal.Data.(bus.InboundMessage); ok {
+							go func() {
+								pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+								defer cancel()
+								al.bus.PublishInbound(pubCtx, msg)
+							}()
+						}
+					}
+
+					// Return interruption error
+					return "", iteration, ErrInterrupted
+				}
+			}
+
 			argsJSON, _ := json.Marshal(tc.Arguments)
 			argsPreview := utils.Truncate(string(argsJSON), 200)
 			logger.InfoCF("agent", fmt.Sprintf("Tool call: %s(%s)", tc.Name, argsPreview),
@@ -928,6 +1505,58 @@ func (al *AgentLoop) runLLMIteration(
 
 			// Save tool result message to session
 			agent.Sessions.AddFullMessage(opts.SessionKey, toolResultMsg)
+		}
+
+		// ===== NEW: Steering Architecture - Check for interruptions after tool execution =====
+		if al.enableSteering {
+			checker := al.getOrCreateChecker(opts.SessionKey)
+			pending := checker.DrainAll()
+
+			if len(pending) > 0 {
+				logger.InfoCF("agent", "Steering: injecting interruption messages",
+					map[string]any{
+						"session_key":   opts.SessionKey,
+						"pending_count": len(pending),
+						"iteration":     iteration,
+					})
+
+				// Send progress update to user showing tool results before handling interruption
+				if !constants.IsInternalChannel(opts.Channel) {
+					// Build a brief summary of what just completed
+					completedTools := []string{}
+					for _, msg := range messages {
+						if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+							for _, tc := range msg.ToolCalls {
+								completedTools = append(completedTools, tc.Name)
+							}
+						}
+					}
+
+					progressMsg := fmt.Sprintf("⚡ Completed: %s\n📥 Processing new request...",
+						utils.Truncate(fmt.Sprint(completedTools), 100))
+
+					al.bus.PublishOutbound(ctx, bus.OutboundMessage{
+						Channel: opts.Channel,
+						ChatID:  opts.ChatID,
+						Content: progressMsg,
+					})
+				}
+
+				// Format and inject interruption
+				injectionContent := formatInterruptionInjection(pending)
+				injectionMsg := providers.Message{
+					Role:    "user",
+					Content: injectionContent,
+				}
+				messages = append(messages, injectionMsg)
+
+				// Save injection to session for context continuity
+				agent.Sessions.AddMessage(opts.SessionKey, "user", injectionContent)
+
+				// Continue to next iteration with injected message
+				// The LLM will decide how to handle both the original task and the new request
+				continue
+			}
 		}
 	}
 
@@ -1161,9 +1790,9 @@ func (al *AgentLoop) summarizeSession(agent *AgentInstance, sessionKey string) {
 			nil,
 			agent.Model,
 			map[string]any{
-				"max_tokens":       1024,
-				"temperature":      0.3,
-				"prompt_cache_key": agent.ID,
+				"max_tokens":  1024,
+				"temperature": 0.3,
+				// "prompt_cache_key": agent.ID,
 			},
 		)
 		if err == nil {
@@ -1212,9 +1841,9 @@ func (al *AgentLoop) summarizeBatch(
 		nil,
 		agent.Model,
 		map[string]any{
-			"max_tokens":       1024,
-			"temperature":      0.3,
-			"prompt_cache_key": agent.ID,
+			"max_tokens":  1024,
+			"temperature": 0.3,
+			// "prompt_cache_key": agent.ID,
 		},
 	)
 	if err != nil {
@@ -1293,6 +1922,77 @@ func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) 
 			return fmt.Sprintf("Unknown list target: %s", args[0]), true
 		}
 
+	case "/stop", "/cancel", "/abort":
+		// Phase 2: Cancel running tasks for the current session
+		runningTasks := al.taskManager.GetRunningTasksForSession(msg.Channel, msg.ChatID)
+
+		// Filter out command tasks from the count (exclude tasks with is_command metadata)
+		nonCommandTasks := make([]*Task, 0)
+		for _, task := range runningTasks {
+			if isCmd, ok := task.Metadata["is_command"].(bool); !ok || !isCmd {
+				nonCommandTasks = append(nonCommandTasks, task)
+			}
+		}
+
+		if len(nonCommandTasks) == 0 {
+			// No running tasks to cancel
+			return "ℹ️ 没有正在运行的任务需要取消。\nNo running tasks to cancel.", true
+		}
+
+		// Cancel all tasks (including command tasks)
+		canceled := al.taskManager.CancelAllTasksForSession(msg.Channel, msg.ChatID)
+
+		// Sanitize session history to remove incomplete tool_use/tool_result pairs
+		// This prevents API errors (e.g., "tool_use ids were found without tool_result blocks")
+		// when resuming after cancellation
+		route := al.registry.ResolveRoute(routing.RouteInput{
+			Channel:    msg.Channel,
+			AccountID:  msg.Metadata["account_id"],
+			Peer:       extractPeer(msg),
+			ParentPeer: extractParentPeer(msg),
+			GuildID:    msg.Metadata["guild_id"],
+			TeamID:     msg.Metadata["team_id"],
+		})
+		agent, _ := al.registry.GetAgent(route.AgentID)
+		if agent == nil {
+			agent = al.registry.GetDefaultAgent()
+		}
+		sessionSanitized := false
+		if agent != nil {
+			sessionKey := route.SessionKey
+			if msg.SessionKey != "" && strings.HasPrefix(msg.SessionKey, "agent:") {
+				sessionKey = msg.SessionKey
+			}
+			// Sanitize the session history to remove incomplete tool call sequences
+			history := agent.Sessions.GetHistory(sessionKey)
+			sanitizedHistory := sanitizeIncompleteToolCalls(history)
+			agent.Sessions.SetHistory(sessionKey, sanitizedHistory)
+			agent.Sessions.Save(sessionKey)
+			sessionSanitized = len(history) != len(sanitizedHistory)
+		}
+
+		logger.InfoCF("agent", "User canceled running tasks",
+			map[string]any{
+				"channel":           msg.Channel,
+				"chat_id":           msg.ChatID,
+				"command":           cmd,
+				"total_canceled":    canceled,
+				"non_command_count": len(nonCommandTasks),
+				"session_sanitized": sessionSanitized,
+			})
+
+		// Build response message using non-command task count
+		var response string
+		nonCommandCount := len(nonCommandTasks)
+		if nonCommandCount == 1 {
+			response = "🛑 已取消 1 个正在运行的任务。\n✅ 已就绪，可以处理新的请求。\n\nCanceled 1 running task. Ready for new requests."
+		} else {
+			response = fmt.Sprintf("🛑 已取消 %d 个正在运行的任务。\n✅ 已就绪，可以处理新的请求。\n\nCanceled %d running tasks. Ready for new requests.",
+				nonCommandCount, nonCommandCount)
+		}
+
+		return response, true
+
 	case "/switch":
 		if len(args) < 3 || args[1] != "to" {
 			return "Usage: /switch [model|channel] to <name>", true
@@ -1349,4 +2049,88 @@ func extractParentPeer(msg bus.InboundMessage) *routing.RoutePeer {
 		return nil
 	}
 	return &routing.RoutePeer{Kind: parentKind, ID: parentID}
+}
+
+// sanitizeIncompleteToolCalls removes assistant messages with tool calls that don't have
+// corresponding tool result messages. This prevents API errors when resuming after task cancellation.
+//
+// The function walks through the message history and:
+// 1. Identifies assistant messages with tool calls
+// 2. Checks if each tool call has a matching tool result in the next messages
+// 3. Removes assistant messages with incomplete tool call sequences
+//
+// This is necessary because Claude's API requires every tool_use block to have a corresponding
+// tool_result block immediately after in the conversation flow.
+func sanitizeIncompleteToolCalls(messages []providers.Message) []providers.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	sanitized := make([]providers.Message, 0, len(messages))
+
+	for i := 0; i < len(messages); i++ {
+		msg := messages[i]
+
+		// If this is an assistant message with tool calls, check if all tool calls have results
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			// Collect all tool call IDs from this message
+			toolCallIDs := make(map[string]bool)
+			for _, tc := range msg.ToolCalls {
+				toolCallIDs[tc.ID] = true
+			}
+
+			// Look ahead to find tool results for these calls
+			foundResults := make(map[string]bool)
+			for j := i + 1; j < len(messages); j++ {
+				nextMsg := messages[j]
+				if nextMsg.Role == "tool" && nextMsg.ToolCallID != "" {
+					if toolCallIDs[nextMsg.ToolCallID] {
+						foundResults[nextMsg.ToolCallID] = true
+					}
+				}
+				// Stop looking once we hit another assistant message or user message
+				// (tool results must immediately follow the assistant message with tool calls)
+				if nextMsg.Role == "assistant" || nextMsg.Role == "user" {
+					break
+				}
+			}
+
+			// Only keep this assistant message if ALL tool calls have results
+			if len(foundResults) == len(toolCallIDs) {
+				sanitized = append(sanitized, msg)
+			} else {
+				// Skip this assistant message and all its tool results
+				logger.WarnCF("agent", "Removing incomplete tool call sequence",
+					map[string]any{
+						"expected_results": len(toolCallIDs),
+						"found_results":    len(foundResults),
+						"tool_call_ids":    getToolCallIDsList(msg.ToolCalls),
+					})
+
+				// Also skip the subsequent tool result messages that belong to this assistant message
+				for j := i + 1; j < len(messages); j++ {
+					nextMsg := messages[j]
+					if nextMsg.Role == "tool" && toolCallIDs[nextMsg.ToolCallID] {
+						i = j // Skip this tool result too
+					} else {
+						break
+					}
+				}
+			}
+		} else {
+			// Keep non-assistant messages or assistant messages without tool calls
+			sanitized = append(sanitized, msg)
+		}
+	}
+
+	return sanitized
+}
+
+// getToolCallIDsList extracts tool call IDs for logging
+func getToolCallIDsList(toolCalls []providers.ToolCall) []string {
+	ids := make([]string, len(toolCalls))
+	for i, tc := range toolCalls {
+		ids[i] = tc.ID
+	}
+	return ids
 }

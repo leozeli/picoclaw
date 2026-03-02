@@ -179,6 +179,16 @@ type AgentDefaults struct {
 	MaxTokens           int      `json:"max_tokens"                      env:"PICOCLAW_AGENTS_DEFAULTS_MAX_TOKENS"`
 	Temperature         *float64 `json:"temperature,omitempty"           env:"PICOCLAW_AGENTS_DEFAULTS_TEMPERATURE"`
 	MaxToolIterations   int      `json:"max_tool_iterations"             env:"PICOCLAW_AGENTS_DEFAULTS_MAX_TOOL_ITERATIONS"`
+
+	// Steering architecture (nanobot-inspired, opt-in)
+	EnableSteering bool `json:"enable_steering,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_ENABLE_STEERING"` // Enable message injection during tool execution
+
+	// Legacy: Phase 2 concurrent task management (to be deprecated)
+	MaxConcurrentTasks      int  `json:"max_concurrent_tasks,omitempty"       env:"PICOCLAW_AGENTS_DEFAULTS_MAX_CONCURRENT_TASKS"`       // Maximum concurrent tasks (0=unlimited)
+	EnableSteeringLoop      bool `json:"enable_steering_loop,omitempty"       env:"PICOCLAW_AGENTS_DEFAULTS_ENABLE_STEERING_LOOP"`       // Enable steering loop for interrupt monitoring
+	SteeringLoopIntervalMs  int  `json:"steering_loop_interval_ms,omitempty"  env:"PICOCLAW_AGENTS_DEFAULTS_STEERING_LOOP_INTERVAL_MS"`  // Steering loop check interval (ms)
+	TaskCleanupIntervalMins int  `json:"task_cleanup_interval_mins,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_TASK_CLEANUP_INTERVAL_MINS"` // Task cleanup interval (minutes)
+	TaskRetentionHours      int  `json:"task_retention_hours,omitempty"       env:"PICOCLAW_AGENTS_DEFAULTS_TASK_RETENTION_HOURS"`       // Task retention time (hours)
 }
 
 // GetModelName returns the effective model name for the agent defaults.
