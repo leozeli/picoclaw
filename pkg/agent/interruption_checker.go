@@ -7,6 +7,7 @@ package agent
 
 import (
 	"sync"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
 )
@@ -20,24 +21,36 @@ import (
 // - Thread-safe for concurrent access
 // - Simple API: Signal, DrainAll, HasPending
 // - Zero overhead when not in use
+// - Grace period to handle race conditions
 type InterruptionChecker struct {
-	queue []bus.InboundMessage
-	mu    sync.Mutex
+	queue          []bus.InboundMessage
+	mu             sync.Mutex
+	gracePeriodEnd time.Time // Allow signaling even after session "ends"
+	active         bool      // Whether session is actively processing
 }
 
 // NewInterruptionChecker creates a new checker for a session
 func NewInterruptionChecker() *InterruptionChecker {
 	return &InterruptionChecker{
-		queue: make([]bus.InboundMessage, 0, 10), // Pre-allocate for common case
+		queue:  make([]bus.InboundMessage, 0, 10), // Pre-allocate for common case
+		active: true,                              // Start as active
 	}
 }
 
 // Signal pushes a new interrupting message into the queue.
 // This is called when a new message arrives for an already-active session.
-func (ic *InterruptionChecker) Signal(msg bus.InboundMessage) {
+// Messages are accepted during active period OR within grace period.
+func (ic *InterruptionChecker) Signal(msg bus.InboundMessage) bool {
 	ic.mu.Lock()
 	defer ic.mu.Unlock()
-	ic.queue = append(ic.queue, msg)
+
+	// Accept message if session is active OR within grace period
+	if ic.active || time.Now().Before(ic.gracePeriodEnd) {
+		ic.queue = append(ic.queue, msg)
+		return true
+	}
+
+	return false
 }
 
 // DrainAll returns and clears all pending messages.
@@ -92,4 +105,28 @@ func (ic *InterruptionChecker) Clear() {
 	ic.mu.Lock()
 	defer ic.mu.Unlock()
 	ic.queue = ic.queue[:0]
+}
+
+// SetGracePeriod sets a grace period during which messages can still be signaled
+// even after the session becomes "inactive". This handles race conditions where
+// messages arrive just as the LLM is finishing.
+func (ic *InterruptionChecker) SetGracePeriod(duration time.Duration) {
+	ic.mu.Lock()
+	defer ic.mu.Unlock()
+	ic.gracePeriodEnd = time.Now().Add(duration)
+	ic.active = false // Mark as inactive but accept messages during grace period
+}
+
+// IsActive returns true if the checker is still active or within grace period
+func (ic *InterruptionChecker) IsActive() bool {
+	ic.mu.Lock()
+	defer ic.mu.Unlock()
+	return ic.active || time.Now().Before(ic.gracePeriodEnd)
+}
+
+// Deactivate marks the checker as inactive (but respects grace period)
+func (ic *InterruptionChecker) Deactivate() {
+	ic.mu.Lock()
+	defer ic.mu.Unlock()
+	ic.active = false
 }

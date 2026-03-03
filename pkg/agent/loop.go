@@ -232,16 +232,27 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				if al.hasActiveChecker(sessionKey) {
 					// Session is active, signal interruption instead of creating new task
 					checker := al.getOrCreateChecker(sessionKey)
-					checker.Signal(msg)
+					signaled := checker.Signal(msg)
 
-					logger.InfoCF("agent", "Steering: signaled interruption for active session",
-						map[string]any{
-							"session_key":     sessionKey,
-							"channel":         msg.Channel,
-							"chat_id":         msg.ChatID,
-							"content_preview": utils.Truncate(msg.Content, 60),
-						})
-					continue // Don't process as new message
+					if signaled {
+						logger.InfoCF("agent", "Steering: signaled interruption for active session",
+							map[string]any{
+								"session_key":     sessionKey,
+								"channel":         msg.Channel,
+								"chat_id":         msg.ChatID,
+								"content_preview": utils.Truncate(msg.Content, 60),
+							})
+						continue // Don't process as new message
+					} else {
+						// Grace period expired, treat as new message
+						logger.WarnCF("agent", "Steering: session checker exists but grace period expired, processing as new message",
+							map[string]any{
+								"session_key": sessionKey,
+								"channel":     msg.Channel,
+								"chat_id":     msg.ChatID,
+							})
+						// Fall through to process as new message
+					}
 				}
 			}
 
@@ -924,10 +935,42 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	// ===== NEW: Steering Architecture - Setup checker for this session =====
 	if al.enableSteering {
 		// Create checker to signal this session is active
-		al.getOrCreateChecker(opts.SessionKey)
+		checker := al.getOrCreateChecker(opts.SessionKey)
 
-		// Cleanup checker when done
-		defer al.removeChecker(opts.SessionKey)
+		// Cleanup with grace period to handle race conditions
+		defer func() {
+			// Set grace period before checking for late arrivals
+			checker.SetGracePeriod(2 * time.Second)
+
+			// Wait briefly for any race-condition messages
+			time.Sleep(150 * time.Millisecond)
+
+			// Check one final time for pending interruptions
+			finalPending := checker.DrainAll()
+			if len(finalPending) > 0 {
+				logger.InfoCF("agent", "Steering: found interruptions during grace period, reprocessing",
+					map[string]any{
+						"session_key":   opts.SessionKey,
+						"pending_count": len(finalPending),
+						"channel":       opts.Channel,
+						"chat_id":       opts.ChatID,
+					})
+
+				// Re-trigger processing by publishing as new inbound message
+				// Combine all pending messages
+				injectionContent := formatInterruptionInjection(finalPending)
+				al.bus.PublishInbound(ctx, bus.InboundMessage{
+					Channel:    opts.Channel,
+					ChatID:     opts.ChatID,
+					SessionKey: opts.SessionKey,
+					Content:    injectionContent,
+					Metadata:   make(map[string]string), // Empty metadata for re-triggered message
+				})
+			}
+
+			// Now safe to remove checker
+			al.removeChecker(opts.SessionKey)
+		}()
 	}
 
 	// 0a. Update interrupt handler context
@@ -1271,7 +1314,7 @@ func (al *AgentLoop) runLLMIteration(
 			if al.enableSteering {
 				checker := al.getOrCreateChecker(opts.SessionKey)
 				pending := checker.DrainAll()
-				
+
 				if len(pending) > 0 {
 					logger.InfoCF("agent", "Steering: LLM finished but has pending interruptions, injecting",
 						map[string]any{
@@ -1279,7 +1322,7 @@ func (al *AgentLoop) runLLMIteration(
 							"pending_count": len(pending),
 							"iteration":     iteration,
 						})
-					
+
 					// Save the assistant's response first
 					assistantMsg := providers.Message{
 						Role:    "assistant",
@@ -1287,7 +1330,7 @@ func (al *AgentLoop) runLLMIteration(
 					}
 					messages = append(messages, assistantMsg)
 					agent.Sessions.AddMessage(opts.SessionKey, "assistant", response.Content)
-					
+
 					// Send the response to user
 					if !constants.IsInternalChannel(opts.Channel) {
 						al.bus.PublishOutbound(ctx, bus.OutboundMessage{
@@ -1296,7 +1339,7 @@ func (al *AgentLoop) runLLMIteration(
 							Content: response.Content,
 						})
 					}
-					
+
 					// Format and inject interruption
 					injectionContent := formatInterruptionInjection(pending)
 					injectionMsg := providers.Message{
@@ -1305,12 +1348,12 @@ func (al *AgentLoop) runLLMIteration(
 					}
 					messages = append(messages, injectionMsg)
 					agent.Sessions.AddMessage(opts.SessionKey, "user", injectionContent)
-					
+
 					// Continue to handle the interruption
 					continue
 				}
 			}
-			
+
 			// No interruptions, finish normally
 			finalContent = response.Content
 			logger.InfoCF("agent", "LLM response without tool calls (direct answer)",
@@ -1319,6 +1362,53 @@ func (al *AgentLoop) runLLMIteration(
 					"iteration":     iteration,
 					"content_chars": len(finalContent),
 				})
+
+			// FINAL SAFETY CHECK: One more check for race-condition interruptions
+			// This catches messages that arrived while we were processing the final response
+			if al.enableSteering {
+				time.Sleep(100 * time.Millisecond) // Brief wait for any in-flight messages
+				checker := al.getOrCreateChecker(opts.SessionKey)
+				lastMinutePending := checker.DrainAll()
+
+				if len(lastMinutePending) > 0 {
+					logger.InfoCF("agent", "Steering: caught last-minute interruptions after final response",
+						map[string]any{
+							"session_key":   opts.SessionKey,
+							"pending_count": len(lastMinutePending),
+							"iteration":     iteration,
+						})
+
+					// Save assistant's response first
+					assistantMsg := providers.Message{
+						Role:    "assistant",
+						Content: response.Content,
+					}
+					messages = append(messages, assistantMsg)
+					agent.Sessions.AddMessage(opts.SessionKey, "assistant", response.Content)
+
+					// Send response to user
+					if !constants.IsInternalChannel(opts.Channel) {
+						al.bus.PublishOutbound(ctx, bus.OutboundMessage{
+							Channel: opts.Channel,
+							ChatID:  opts.ChatID,
+							Content: response.Content,
+						})
+					}
+
+					// Inject last-minute interruptions
+					injectionContent := formatInterruptionInjection(lastMinutePending)
+					injectionMsg := providers.Message{
+						Role:    "user",
+						Content: injectionContent,
+					}
+					messages = append(messages, injectionMsg)
+					agent.Sessions.AddMessage(opts.SessionKey, "user", injectionContent)
+
+					// Continue to handle these interruptions
+					continue
+				}
+			}
+
 			break
 		}
 
