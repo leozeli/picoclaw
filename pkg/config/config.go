@@ -182,7 +182,6 @@ type AgentDefaults struct {
 	MaxToolIterations         int      `json:"max_tool_iterations"             env:"PICOCLAW_AGENTS_DEFAULTS_MAX_TOOL_ITERATIONS"`
 
 	// Steering architecture (nanobot-inspired, opt-in)
-	EnableSteering bool `json:"enable_steering,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_ENABLE_STEERING"` // Enable message injection during tool execution
 
 	// Legacy: Phase 2 concurrent task management (to be deprecated)
 	MaxConcurrentTasks      int  `json:"max_concurrent_tasks,omitempty"       env:"PICOCLAW_AGENTS_DEFAULTS_MAX_CONCURRENT_TASKS"`       // Maximum concurrent tasks (0=unlimited)

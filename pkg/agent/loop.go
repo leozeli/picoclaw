@@ -44,14 +44,9 @@ type AgentLoop struct {
 	channelManager *channels.Manager
 	mediaStore     media.MediaStore
 
-	// Legacy interrupt handling (to be deprecated)
+	// Task management for concurrent task tracking
 	interruptHandler InterruptHandler // Interrupt handler for dynamic task management
-	taskManager      *TaskManager     // Task manager for concurrent task tracking (Phase 2)
-
-	// New steering architecture (nanobot-inspired)
-	enableSteering    bool                            // Opt-in flag for steering feature
-	interruptCheckers map[string]*InterruptionChecker // Per-session interrupt queues
-	checkersMu        sync.RWMutex                    // Protects interruptCheckers map
+	taskManager      *TaskManager     // Task manager for concurrent task tracking
 }
 
 // processOptions configures how a message is processed
@@ -96,24 +91,17 @@ func NewAgentLoop(
 		state:       stateManager,
 		summarizing: sync.Map{},
 		fallback:    fallbackChain,
-
-		// New steering architecture (nanobot-inspired)
-		enableSteering:    cfg.Agents.Defaults.EnableSteering,
-		interruptCheckers: make(map[string]*InterruptionChecker),
 	}
 
-	// Legacy components (DEPRECATED - only initialized when new steering is disabled)
-	if !cfg.Agents.Defaults.EnableSteering {
-		// Legacy interrupt handler (Phase 1.5)
-		al.interruptHandler = NewBusInterruptHandler(msgBus, DefaultInterruptionConfig())
+	// Initialize interrupt handler
+	al.interruptHandler = NewBusInterruptHandler(msgBus, DefaultInterruptionConfig())
 
-		// Legacy TaskManager (Phase 2)
-		maxConcurrent := cfg.Agents.Defaults.MaxConcurrentTasks
-		if maxConcurrent < 0 {
-			maxConcurrent = 0 // Ensure no negative values, 0 = unlimited
-		}
-		al.taskManager = NewTaskManager(maxConcurrent)
+	// Initialize TaskManager for concurrent task tracking
+	maxConcurrent := cfg.Agents.Defaults.MaxConcurrentTasks
+	if maxConcurrent < 0 {
+		maxConcurrent = 0 // Ensure no negative values, 0 = unlimited
 	}
+	al.taskManager = NewTaskManager(maxConcurrent)
 
 	return al
 }
@@ -268,62 +256,18 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 		}
 	}
 
-	// Legacy: Start task cleanup and steering loop only when new steering is disabled
-	if !al.enableSteering {
-		// Phase 2: Start task cleanup goroutine
-		go al.runTaskCleanup(ctx)
-
-		// Phase 2: Start steering loop if enabled
-		if al.cfg.Agents.Defaults.EnableSteeringLoop {
-			go al.runSteeringLoop(ctx)
-		}
-	}
+	// Phase 2: Start task cleanup goroutine
+	go al.runTaskCleanup(ctx)
 
 	for al.running.Load() {
 		select {
 		case <-ctx.Done():
 			// Legacy: Wait for running tasks to complete (only if using TaskManager)
-			if !al.enableSteering && al.taskManager != nil {
-				al.waitForRunningTasks(5 * time.Second)
-			}
 			return nil
 		default:
 			msg, ok := al.bus.ConsumeInbound(ctx)
 			if !ok {
 				continue
-			}
-
-			// ===== NEW: Steering Architecture - Check for active session =====
-			if al.enableSteering {
-				// Get session key for this message (needs routing resolution)
-				sessionKey := al.getSessionKeyForMessage(msg)
-
-				// Check if this session has an active checker (task is running)
-				if al.hasActiveChecker(sessionKey) {
-					// Session is active, signal interruption instead of creating new task
-					checker := al.getOrCreateChecker(sessionKey)
-					signaled := checker.Signal(msg)
-
-					if signaled {
-						logger.InfoCF("agent", "Steering: signaled interruption for active session",
-							map[string]any{
-								"session_key":     sessionKey,
-								"channel":         msg.Channel,
-								"chat_id":         msg.ChatID,
-								"content_preview": utils.Truncate(msg.Content, 60),
-							})
-						continue // Don't process as new message
-					} else {
-						// Grace period expired, treat as new message
-						logger.WarnCF("agent", "Steering: session checker exists but grace period expired, processing as new message",
-							map[string]any{
-								"session_key": sessionKey,
-								"channel":     msg.Channel,
-								"chat_id":     msg.ChatID,
-							})
-						// Fall through to process as new message
-					}
-				}
 			}
 
 			// Phase 2: Process message asynchronously
@@ -465,31 +409,6 @@ func (al *AgentLoop) waitForRunningTasks(timeout time.Duration) {
 	}
 }
 
-// runSteeringLoop monitors for interrupt signals and cancels tasks (Phase 2 Step 5)
-func (al *AgentLoop) runSteeringLoop(ctx context.Context) {
-	// Get interval from config, default to 500ms
-	intervalMs := al.cfg.Agents.Defaults.SteeringLoopIntervalMs
-	if intervalMs <= 0 {
-		intervalMs = 500
-	}
-
-	ticker := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
-	defer ticker.Stop()
-
-	logger.InfoCF("agent", "Steering loop started",
-		map[string]any{"interval_ms": intervalMs})
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.InfoCF("agent", "Steering loop stopped", nil)
-			return
-		case <-ticker.C:
-			al.checkAndHandleInterrupts(ctx)
-		}
-	}
-}
-
 // checkAndHandleInterrupts checks for interrupt signals and handles them (Phase 2 Step 5)
 func (al *AgentLoop) checkAndHandleInterrupts(ctx context.Context) {
 	if al.interruptHandler == nil {
@@ -554,104 +473,6 @@ func (al *AgentLoop) RegisterTool(tool tools.Tool) {
 			agent.Tools.Register(tool)
 		}
 	}
-}
-
-// ===== Steering Architecture: InterruptionChecker Management =====
-
-// getOrCreateChecker gets or creates an interruption checker for a session.
-// Thread-safe with double-checked locking pattern.
-func (al *AgentLoop) getOrCreateChecker(sessionKey string) *InterruptionChecker {
-	// Fast path: read lock
-	al.checkersMu.RLock()
-	checker, exists := al.interruptCheckers[sessionKey]
-	al.checkersMu.RUnlock()
-
-	if exists {
-		return checker
-	}
-
-	// Slow path: write lock
-	al.checkersMu.Lock()
-	defer al.checkersMu.Unlock()
-
-	// Double-check after acquiring write lock
-	if checker, exists := al.interruptCheckers[sessionKey]; exists {
-		return checker
-	}
-
-	// Create new checker
-	checker = NewInterruptionChecker()
-	al.interruptCheckers[sessionKey] = checker
-
-	logger.DebugCF("agent", "Created interruption checker for session",
-		map[string]any{"session_key": sessionKey})
-
-	return checker
-}
-
-// formatInterruptionInjection formats pending interruption messages for injection into conversation.
-// This follows nanobot's pattern of providing context to the LLM about the interruption.
-func formatInterruptionInjection(pending []bus.InboundMessage) string {
-	if len(pending) == 0 {
-		return ""
-	}
-
-	var combined strings.Builder
-	for i, msg := range pending {
-		if i > 0 {
-			combined.WriteString("\n\n---\n\n")
-		}
-		combined.WriteString(msg.Content)
-	}
-
-	injection := "[The user just sent a new message while you were working. " +
-		"Read it and decide: continue current work, switch to the new request, or address both.]\n\n" +
-		combined.String()
-
-	return injection
-}
-
-// removeChecker removes a checker when session completes.
-// This prevents memory leaks for long-running processes.
-func (al *AgentLoop) removeChecker(sessionKey string) {
-	al.checkersMu.Lock()
-	defer al.checkersMu.Unlock()
-
-	if _, exists := al.interruptCheckers[sessionKey]; exists {
-		delete(al.interruptCheckers, sessionKey)
-		logger.DebugCF("agent", "Removed interruption checker for session",
-			map[string]any{"session_key": sessionKey})
-	}
-}
-
-// hasActiveChecker checks if a session has an active interruption checker.
-// This indicates the session is currently processing a message.
-func (al *AgentLoop) hasActiveChecker(sessionKey string) bool {
-	al.checkersMu.RLock()
-	defer al.checkersMu.RUnlock()
-	_, exists := al.interruptCheckers[sessionKey]
-	return exists
-}
-
-// getSessionKeyForMessage resolves the session key for a message using routing logic.
-// This is needed to check if the session has an active task before creating a new one.
-func (al *AgentLoop) getSessionKeyForMessage(msg bus.InboundMessage) string {
-	// If message already has an agent-scoped session key, use it
-	if msg.SessionKey != "" && strings.HasPrefix(msg.SessionKey, "agent:") {
-		return msg.SessionKey
-	}
-
-	// Otherwise, resolve via routing
-	route := al.registry.ResolveRoute(routing.RouteInput{
-		Channel:    msg.Channel,
-		AccountID:  msg.Metadata["account_id"],
-		Peer:       extractPeer(msg),
-		ParentPeer: extractParentPeer(msg),
-		GuildID:    msg.Metadata["guild_id"],
-		TeamID:     msg.Metadata["team_id"],
-	})
-
-	return route.SessionKey
 }
 
 func (al *AgentLoop) SetChannelManager(cm *channels.Manager) {
@@ -781,9 +602,6 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 	)
 
 	// New steering architecture: Direct processing without task management
-	if al.enableSteering {
-		return al.processMessageDirect(ctx, msg)
-	}
 
 	// Legacy: Phase 2 task management
 	priority := 5 // Default priority
@@ -824,59 +642,6 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 
 	// Task will be completed by defer
 	return response, nil
-}
-
-// processMessageDirect handles message processing for new steering architecture (no task management)
-func (al *AgentLoop) processMessageDirect(ctx context.Context, msg bus.InboundMessage) (string, error) {
-	// Route system messages to processSystemMessage
-	if msg.Channel == "system" {
-		return al.processSystemMessage(ctx, msg)
-	}
-
-	// Check for commands
-	if response, handled := al.handleCommand(ctx, msg); handled {
-		return response, nil
-	}
-
-	// Route to determine agent and session key
-	route := al.registry.ResolveRoute(routing.RouteInput{
-		Channel:    msg.Channel,
-		AccountID:  msg.Metadata["account_id"],
-		Peer:       extractPeer(msg),
-		ParentPeer: extractParentPeer(msg),
-		GuildID:    msg.Metadata["guild_id"],
-		TeamID:     msg.Metadata["team_id"],
-	})
-
-	agent, ok := al.registry.GetAgent(route.AgentID)
-	if !ok {
-		agent = al.registry.GetDefaultAgent()
-	}
-	if agent == nil {
-		return "", fmt.Errorf("no agent available for route (agent_id=%s)", route.AgentID)
-	}
-
-	// Reset message-tool state for this round
-	if tool, ok := agent.Tools.Get("message"); ok {
-		if mt, ok := tool.(tools.ContextualTool); ok {
-			mt.SetContext(msg.Channel, msg.ChatID)
-		}
-	}
-
-	// Use routed session key, but honor pre-set agent-scoped keys
-	sessionKey := route.SessionKey
-	if msg.SessionKey != "" && strings.HasPrefix(msg.SessionKey, "agent:") {
-		sessionKey = msg.SessionKey
-	}
-
-	return al.runAgentLoop(ctx, agent, processOptions{
-		SessionKey:    sessionKey,
-		Channel:       msg.Channel,
-		ChatID:        msg.ChatID,
-		UserMessage:   msg.Content,
-		EnableSummary: true,
-		SendResponse:  false,
-	})
 }
 
 // processMessageWithTask handles the actual message processing logic with task context (LEGACY)
@@ -1013,45 +778,6 @@ func (al *AgentLoop) runAgentLoop(
 	}
 
 	// ===== NEW: Steering Architecture - Setup checker for this session =====
-	if al.enableSteering {
-		// Create checker to signal this session is active
-		checker := al.getOrCreateChecker(opts.SessionKey)
-
-		// Cleanup with grace period to handle race conditions
-		defer func() {
-			// Set grace period before checking for late arrivals
-			checker.SetGracePeriod(2 * time.Second)
-
-			// Wait briefly for any race-condition messages
-			time.Sleep(150 * time.Millisecond)
-
-			// Check one final time for pending interruptions
-			finalPending := checker.DrainAll()
-			if len(finalPending) > 0 {
-				logger.InfoCF("agent", "Steering: found interruptions during grace period, reprocessing",
-					map[string]any{
-						"session_key":   opts.SessionKey,
-						"pending_count": len(finalPending),
-						"channel":       opts.Channel,
-						"chat_id":       opts.ChatID,
-					})
-
-				// Re-trigger processing by publishing as new inbound message
-				// Combine all pending messages
-				injectionContent := formatInterruptionInjection(finalPending)
-				al.bus.PublishInbound(ctx, bus.InboundMessage{
-					Channel:    opts.Channel,
-					ChatID:     opts.ChatID,
-					SessionKey: opts.SessionKey,
-					Content:    injectionContent,
-					Metadata:   make(map[string]string), // Empty metadata for re-triggered message
-				})
-			}
-
-			// Now safe to remove checker
-			al.removeChecker(opts.SessionKey)
-		}()
-	}
 
 	// 0a. Update interrupt handler context
 	if busHandler, ok := al.interruptHandler.(*BusInterruptHandler); ok {
@@ -1418,48 +1144,6 @@ func (al *AgentLoop) runLLMIteration(
 		// Check if no tool calls - but first check for pending interruptions
 		if len(response.ToolCalls) == 0 {
 			// NEW: Check for pending interruptions before finishing
-			if al.enableSteering {
-				checker := al.getOrCreateChecker(opts.SessionKey)
-				pending := checker.DrainAll()
-
-				if len(pending) > 0 {
-					logger.InfoCF("agent", "Steering: LLM finished but has pending interruptions, injecting",
-						map[string]any{
-							"session_key":   opts.SessionKey,
-							"pending_count": len(pending),
-							"iteration":     iteration,
-						})
-
-					// Save the assistant's response first
-					assistantMsg := providers.Message{
-						Role:    "assistant",
-						Content: response.Content,
-					}
-					messages = append(messages, assistantMsg)
-					agent.Sessions.AddMessage(opts.SessionKey, "assistant", response.Content)
-
-					// Send the response to user
-					if !constants.IsInternalChannel(opts.Channel) {
-						al.bus.PublishOutbound(ctx, bus.OutboundMessage{
-							Channel: opts.Channel,
-							ChatID:  opts.ChatID,
-							Content: response.Content,
-						})
-					}
-
-					// Format and inject interruption
-					injectionContent := formatInterruptionInjection(pending)
-					injectionMsg := providers.Message{
-						Role:    "user",
-						Content: injectionContent,
-					}
-					messages = append(messages, injectionMsg)
-					agent.Sessions.AddMessage(opts.SessionKey, "user", injectionContent)
-
-					// Continue to handle the interruption
-					continue
-				}
-			}
 
 			// No interruptions, finish normally
 			finalContent = response.Content
@@ -1472,49 +1156,6 @@ func (al *AgentLoop) runLLMIteration(
 
 			// FINAL SAFETY CHECK: One more check for race-condition interruptions
 			// This catches messages that arrived while we were processing the final response
-			if al.enableSteering {
-				time.Sleep(100 * time.Millisecond) // Brief wait for any in-flight messages
-				checker := al.getOrCreateChecker(opts.SessionKey)
-				lastMinutePending := checker.DrainAll()
-
-				if len(lastMinutePending) > 0 {
-					logger.InfoCF("agent", "Steering: caught last-minute interruptions after final response",
-						map[string]any{
-							"session_key":   opts.SessionKey,
-							"pending_count": len(lastMinutePending),
-							"iteration":     iteration,
-						})
-
-					// Save assistant's response first
-					assistantMsg := providers.Message{
-						Role:    "assistant",
-						Content: response.Content,
-					}
-					messages = append(messages, assistantMsg)
-					agent.Sessions.AddMessage(opts.SessionKey, "assistant", response.Content)
-
-					// Send response to user
-					if !constants.IsInternalChannel(opts.Channel) {
-						al.bus.PublishOutbound(ctx, bus.OutboundMessage{
-							Channel: opts.Channel,
-							ChatID:  opts.ChatID,
-							Content: response.Content,
-						})
-					}
-
-					// Inject last-minute interruptions
-					injectionContent := formatInterruptionInjection(lastMinutePending)
-					injectionMsg := providers.Message{
-						Role:    "user",
-						Content: injectionContent,
-					}
-					messages = append(messages, injectionMsg)
-					agent.Sessions.AddMessage(opts.SessionKey, "user", injectionContent)
-
-					// Continue to handle these interruptions
-					continue
-				}
-			}
 
 			break
 		}
@@ -1705,56 +1346,6 @@ func (al *AgentLoop) runLLMIteration(
 		}
 
 		// ===== NEW: Steering Architecture - Check for interruptions after tool execution =====
-		if al.enableSteering {
-			checker := al.getOrCreateChecker(opts.SessionKey)
-			pending := checker.DrainAll()
-
-			if len(pending) > 0 {
-				logger.InfoCF("agent", "Steering: injecting interruption messages",
-					map[string]any{
-						"session_key":   opts.SessionKey,
-						"pending_count": len(pending),
-						"iteration":     iteration,
-					})
-
-				// Send progress update to user showing tool results before handling interruption
-				if !constants.IsInternalChannel(opts.Channel) {
-					// Build a brief summary of what just completed
-					completedTools := []string{}
-					for _, msg := range messages {
-						if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-							for _, tc := range msg.ToolCalls {
-								completedTools = append(completedTools, tc.Name)
-							}
-						}
-					}
-
-					progressMsg := fmt.Sprintf("⚡ Completed: %s\n📥 Processing new request...",
-						utils.Truncate(fmt.Sprint(completedTools), 100))
-
-					al.bus.PublishOutbound(ctx, bus.OutboundMessage{
-						Channel: opts.Channel,
-						ChatID:  opts.ChatID,
-						Content: progressMsg,
-					})
-				}
-
-				// Format and inject interruption
-				injectionContent := formatInterruptionInjection(pending)
-				injectionMsg := providers.Message{
-					Role:    "user",
-					Content: injectionContent,
-				}
-				messages = append(messages, injectionMsg)
-
-				// Save injection to session for context continuity
-				agent.Sessions.AddMessage(opts.SessionKey, "user", injectionContent)
-
-				// Continue to next iteration with injected message
-				// The LLM will decide how to handle both the original task and the new request
-				continue
-			}
-		}
 	}
 
 	return finalContent, iteration, nil
@@ -2128,6 +1719,46 @@ func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) 
 		default:
 			return fmt.Sprintf("Unknown list target: %s", args[0]), true
 		}
+
+	case "/clear":
+		// Clear session history to reset conversation state
+		route := al.registry.ResolveRoute(routing.RouteInput{
+			Channel:    msg.Channel,
+			AccountID:  msg.Metadata["account_id"],
+			Peer:       extractPeer(msg),
+			ParentPeer: extractParentPeer(msg),
+			GuildID:    msg.Metadata["guild_id"],
+			TeamID:     msg.Metadata["team_id"],
+		})
+
+		agent, _ := al.registry.GetAgent(route.AgentID)
+		if agent == nil {
+			agent = al.registry.GetDefaultAgent()
+		}
+
+		if agent == nil {
+			return "❌ 没有可用的代理。\nNo agent available.", true
+		}
+
+		sessionKey := route.SessionKey
+		if msg.SessionKey != "" && strings.HasPrefix(msg.SessionKey, "agent:") {
+			sessionKey = msg.SessionKey
+		}
+
+		// Clear the session history (deletes from memory and disk)
+		clearedCount := agent.Sessions.ClearHistory(sessionKey)
+
+		logger.InfoCF("agent", "User cleared session history",
+			map[string]any{
+				"channel":      msg.Channel,
+				"chat_id":      msg.ChatID,
+				"session_key":  sessionKey,
+				"agent_id":     route.AgentID,
+				"cleared_msgs": clearedCount,
+			})
+
+		return fmt.Sprintf("🧹 已清除会话历史（%d 条消息）。\n✨ 会话已重置，可以开始新的对话。\n\nCleared session history (%d messages). Session reset, ready for new conversation.",
+			clearedCount, clearedCount), true
 
 	case "/stop", "/cancel", "/abort":
 		// Phase 2: Cancel running tasks for the current session

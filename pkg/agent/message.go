@@ -17,9 +17,11 @@ const (
 	MessageTypeSystem    AgentMessageType = "system"
 
 	// Extended types for business semantics
-	MessageTypeArtifact   AgentMessageType = "artifact"   // LLM-generated artifacts (code, images, documents)
-	MessageTypeAttachment AgentMessageType = "attachment" // User-provided attachments
-	MessageTypeEvent      AgentMessageType = "event"      // System events (task started, interrupted, etc.)
+	MessageTypeArtifact       AgentMessageType = "artifact"        // LLM-generated artifacts (code, images, documents)
+	MessageTypeAttachment     AgentMessageType = "attachment"      // User-provided attachments
+	MessageTypeEvent          AgentMessageType = "event"           // System events (task started, interrupted, etc.)
+	MessageTypeSubagentResult AgentMessageType = "subagent_result" // Results from subagent execution
+	MessageTypeToolProgress   AgentMessageType = "tool_progress"   // Progress updates from long-running tools
 )
 
 // ArtifactType categorizes the type of artifact
@@ -44,10 +46,10 @@ type AgentMessage struct {
 	ToolCallID       string               `json:"tool_call_id,omitempty"`
 
 	// ===== Extended Fields =====
-	Type      AgentMessageType   `json:"type"`                 // Semantic message type
-	Metadata  map[string]any     `json:"metadata,omitempty"`   // Arbitrary metadata
-	Timestamp time.Time          `json:"timestamp"`            // Message creation time
-	SessionID string             `json:"session_id,omitempty"` // Associated session
+	Type      AgentMessageType `json:"type"`                 // Semantic message type
+	Metadata  map[string]any   `json:"metadata,omitempty"`   // Arbitrary metadata
+	Timestamp time.Time        `json:"timestamp"`            // Message creation time
+	SessionID string           `json:"session_id,omitempty"` // Associated session
 
 	// ===== Artifact-specific Fields =====
 	ArtifactID   string       `json:"artifact_id,omitempty"`   // Unique identifier for artifact
@@ -63,6 +65,21 @@ type AgentMessage struct {
 	// ===== Event-specific Fields =====
 	EventType string         `json:"event_type,omitempty"` // Event category (task_started, interrupted, etc.)
 	EventData map[string]any `json:"event_data,omitempty"` // Event-specific data
+
+	// ===== Subagent-specific Fields (Enhanced) =====
+	SubagentID     string `json:"subagent_id,omitempty"`     // Subagent task ID
+	SubagentLabel  string `json:"subagent_label,omitempty"`  // Subagent task label
+	SubagentStatus string `json:"subagent_status,omitempty"` // Status: running, completed, failed, canceled
+	Iterations     int    `json:"iterations,omitempty"`      // Tool loop iterations executed
+
+	// ===== Progress-specific Fields =====
+	Progress     float64 `json:"progress,omitempty"`      // Progress percentage (0-100)
+	ProgressText string  `json:"progress_text,omitempty"` // Human-readable progress message
+
+	// ===== Context and Routing Fields =====
+	OriginChannel string `json:"origin_channel,omitempty"` // Source channel for routing
+	OriginChatID  string `json:"origin_chat_id,omitempty"` // Source chat ID for routing
+	AgentID       string `json:"agent_id,omitempty"`       // Agent that created this message
 }
 
 // ToLLMMessage converts an AgentMessage to a standard providers.Message
@@ -78,7 +95,7 @@ func (am *AgentMessage) ToLLMMessage() providers.Message {
 }
 
 // ToLLMMessageWithContext converts an AgentMessage to a providers.Message,
-// but includes contextual information about artifacts/attachments in the content.
+// but includes contextual information about artifacts/attachments/subagents in the content.
 func (am *AgentMessage) ToLLMMessageWithContext() providers.Message {
 	msg := am.ToLLMMessage()
 
@@ -97,6 +114,24 @@ func (am *AgentMessage) ToLLMMessageWithContext() providers.Message {
 			msg.Content = am.formatAttachmentReference()
 		} else {
 			msg.Content = am.formatAttachmentReference() + "\n\n" + msg.Content
+		}
+	}
+
+	// Add subagent result context if present
+	if am.Type == MessageTypeSubagentResult && am.SubagentID != "" {
+		if msg.Content == "" {
+			msg.Content = am.formatSubagentReference()
+		} else {
+			msg.Content = am.formatSubagentReference() + "\n\n" + msg.Content
+		}
+	}
+
+	// Add progress context if present
+	if am.Type == MessageTypeToolProgress && am.ProgressText != "" {
+		if msg.Content == "" {
+			msg.Content = am.formatProgressReference()
+		} else {
+			msg.Content = am.formatProgressReference() + "\n\n" + msg.Content
 		}
 	}
 
@@ -285,4 +320,74 @@ func (am *AgentMessage) WithMetadata(key string, value any) *AgentMessage {
 func (am *AgentMessage) WithSessionID(sessionID string) *AgentMessage {
 	am.SessionID = sessionID
 	return am
+}
+
+// NewSubagentResultMessage creates a new subagent result message
+func NewSubagentResultMessage(subagentID, label, status, content string, iterations int) *AgentMessage {
+	return &AgentMessage{
+		Role:           "tool",
+		Content:        content,
+		Type:           MessageTypeSubagentResult,
+		SubagentID:     subagentID,
+		SubagentLabel:  label,
+		SubagentStatus: status,
+		Iterations:     iterations,
+		Timestamp:      time.Now(),
+		Metadata: map[string]any{
+			"source":     "subagent",
+			"task_id":    subagentID,
+			"task_label": label,
+			"status":     status,
+			"iterations": iterations,
+		},
+	}
+}
+
+// NewProgressMessage creates a new progress update message
+func NewProgressMessage(progressText string, progress float64) *AgentMessage {
+	return &AgentMessage{
+		Role:         "assistant",
+		Content:      progressText,
+		Type:         MessageTypeToolProgress,
+		Progress:     progress,
+		ProgressText: progressText,
+		Timestamp:    time.Now(),
+	}
+}
+
+// WithOrigin sets the origin channel and chat ID (builder pattern)
+func (am *AgentMessage) WithOrigin(channel, chatID string) *AgentMessage {
+	am.OriginChannel = channel
+	am.OriginChatID = chatID
+	return am
+}
+
+// WithAgentID sets the agent ID (builder pattern)
+func (am *AgentMessage) WithAgentID(agentID string) *AgentMessage {
+	am.AgentID = agentID
+	return am
+}
+
+// formatSubagentReference creates a human-readable reference to subagent execution
+func (am *AgentMessage) formatSubagentReference() string {
+	ref := "[Subagent"
+	if am.SubagentLabel != "" {
+		ref += " '" + am.SubagentLabel + "'"
+	}
+	if am.SubagentStatus != "" {
+		ref += " " + am.SubagentStatus
+	}
+	if am.Iterations > 0 {
+		ref += " after " + string(rune(am.Iterations)) + " iterations"
+	}
+	ref += "]"
+	return ref
+}
+
+// formatProgressReference creates a human-readable progress indicator
+func (am *AgentMessage) formatProgressReference() string {
+	if am.Progress > 0 {
+		return "[Progress: " + string(rune(int(am.Progress))) + "%] " + am.ProgressText
+	}
+	return am.ProgressText
 }

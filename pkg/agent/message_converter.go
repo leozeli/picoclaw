@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/providers"
 )
@@ -274,5 +275,59 @@ func MergeMessageHistories(histories ...[]*AgentMessage) []*AgentMessage {
 
 	// Sort by timestamp (stable sort preserves order for equal timestamps)
 	// Note: For production use, consider more sophisticated deduplication
+	return result
+}
+
+// ============================================================================
+// Phase 2: Session Integration - Conversion Functions (AgentMessage ↔ providers.Message)
+// ============================================================================
+
+// FromLLMMessage converts a providers.Message to AgentMessage
+// This is primarily used for migrating legacy session data
+func FromLLMMessage(msg providers.Message) *AgentMessage {
+	agentMsg := &AgentMessage{
+		Role:             msg.Role,
+		Content:          msg.Content,
+		ReasoningContent: msg.ReasoningContent,
+		ToolCalls:        msg.ToolCalls,
+		ToolCallID:       msg.ToolCallID,
+		Timestamp:        time.Now(),
+		Metadata:         make(map[string]any),
+	}
+
+	// Infer AgentMessageType from role
+	switch msg.Role {
+	case "user":
+		agentMsg.Type = MessageTypeUser
+	case "assistant":
+		agentMsg.Type = MessageTypeAssistant
+	case "tool":
+		agentMsg.Type = MessageTypeTool
+	case "system":
+		agentMsg.Type = MessageTypeSystem
+	default:
+		agentMsg.Type = MessageTypeUser // Default to user
+	}
+
+	return agentMsg
+}
+
+// FromLLMMessages converts a slice of providers.Message to AgentMessage slice
+// Used for batch migration of legacy session histories
+func FromLLMMessages(messages []providers.Message) []*AgentMessage {
+	result := make([]*AgentMessage, len(messages))
+	for i, msg := range messages {
+		result[i] = FromLLMMessage(msg)
+	}
+	return result
+}
+
+// ToLLMMessages converts a slice of AgentMessage to providers.Message slice
+// Used when passing session history to LLM providers
+func ToLLMMessages(messages []*AgentMessage) []providers.Message {
+	result := make([]providers.Message, len(messages))
+	for i, msg := range messages {
+		result[i] = msg.ToLLMMessageWithContext()
+	}
 	return result
 }
