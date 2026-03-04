@@ -181,14 +181,19 @@ type AgentDefaults struct {
 	Temperature               *float64 `json:"temperature,omitempty"           env:"PICOCLAW_AGENTS_DEFAULTS_TEMPERATURE"`
 	MaxToolIterations         int      `json:"max_tool_iterations"             env:"PICOCLAW_AGENTS_DEFAULTS_MAX_TOOL_ITERATIONS"`
 
-	// Steering architecture (nanobot-inspired, opt-in)
-
-	// Legacy: Phase 2 concurrent task management (to be deprecated)
 	MaxConcurrentTasks      int  `json:"max_concurrent_tasks,omitempty"       env:"PICOCLAW_AGENTS_DEFAULTS_MAX_CONCURRENT_TASKS"`       // Maximum concurrent tasks (0=unlimited)
-	EnableSteeringLoop      bool `json:"enable_steering_loop,omitempty"       env:"PICOCLAW_AGENTS_DEFAULTS_ENABLE_STEERING_LOOP"`       // Enable steering loop for interrupt monitoring
-	SteeringLoopIntervalMs  int  `json:"steering_loop_interval_ms,omitempty"  env:"PICOCLAW_AGENTS_DEFAULTS_STEERING_LOOP_INTERVAL_MS"`  // Steering loop check interval (ms)
 	TaskCleanupIntervalMins int  `json:"task_cleanup_interval_mins,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_TASK_CLEANUP_INTERVAL_MINS"` // Task cleanup interval (minutes)
 	TaskRetentionHours      int  `json:"task_retention_hours,omitempty"       env:"PICOCLAW_AGENTS_DEFAULTS_TASK_RETENTION_HOURS"`       // Task retention time (hours)
+	MaxMediaSize            int  `json:"max_media_size,omitempty"        env:"PICOCLAW_AGENTS_DEFAULTS_MAX_MEDIA_SIZE"`
+}
+
+const DefaultMaxMediaSize = 20 * 1024 * 1024 // 20 MB
+
+func (d *AgentDefaults) GetMaxMediaSize() int {
+	if d.MaxMediaSize > 0 {
+		return d.MaxMediaSize
+	}
+	return DefaultMaxMediaSize
 }
 
 // GetModelName returns the effective model name for the agent defaults.
@@ -246,6 +251,7 @@ type WhatsAppConfig struct {
 type TelegramConfig struct {
 	Enabled            bool                `json:"enabled"                 env:"PICOCLAW_CHANNELS_TELEGRAM_ENABLED"`
 	Token              string              `json:"token"                   env:"PICOCLAW_CHANNELS_TELEGRAM_TOKEN"`
+	BaseURL            string              `json:"base_url"                env:"PICOCLAW_CHANNELS_TELEGRAM_BASE_URL"`
 	Proxy              string              `json:"proxy"                   env:"PICOCLAW_CHANNELS_TELEGRAM_PROXY"`
 	AllowFrom          FlexibleStringSlice `json:"allow_from"              env:"PICOCLAW_CHANNELS_TELEGRAM_ALLOW_FROM"`
 	GroupTrigger       GroupTriggerConfig  `json:"group_trigger,omitempty"`
@@ -262,12 +268,14 @@ type FeishuConfig struct {
 	VerificationToken  string              `json:"verification_token"      env:"PICOCLAW_CHANNELS_FEISHU_VERIFICATION_TOKEN"`
 	AllowFrom          FlexibleStringSlice `json:"allow_from"              env:"PICOCLAW_CHANNELS_FEISHU_ALLOW_FROM"`
 	GroupTrigger       GroupTriggerConfig  `json:"group_trigger,omitempty"`
+	Placeholder        PlaceholderConfig   `json:"placeholder,omitempty"`
 	ReasoningChannelID string              `json:"reasoning_channel_id"    env:"PICOCLAW_CHANNELS_FEISHU_REASONING_CHANNEL_ID"`
 }
 
 type DiscordConfig struct {
 	Enabled            bool                `json:"enabled"                 env:"PICOCLAW_CHANNELS_DISCORD_ENABLED"`
 	Token              string              `json:"token"                   env:"PICOCLAW_CHANNELS_DISCORD_TOKEN"`
+	Proxy              string              `json:"proxy"                   env:"PICOCLAW_CHANNELS_DISCORD_PROXY"`
 	AllowFrom          FlexibleStringSlice `json:"allow_from"              env:"PICOCLAW_CHANNELS_DISCORD_ALLOW_FROM"`
 	MentionOnly        bool                `json:"mention_only"            env:"PICOCLAW_CHANNELS_DISCORD_MENTION_ONLY"`
 	GroupTrigger       GroupTriggerConfig  `json:"group_trigger,omitempty"`
